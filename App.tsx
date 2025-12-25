@@ -360,18 +360,28 @@ const App: React.FC = () => {
   // Track IDs played in the current session (spanning multiple 'legs' if user continues)
   const [playedIds, setPlayedIds] = useState<Set<string>>(new Set());
 
+  // Helper to score positions based on goals (for backfilling)
+  const scorePosition = (p: Position, goals: ClimaxGoal[], filters?: Filters) => {
+    let score = 0;
+    // High value for direct goal matches
+    p.climaxGoals.forEach(g => { if (goals.includes(g)) score += 5; });
+    // Bonus for tags matching common goal archetypes
+    if (goals.includes('Intimacy') && (p.tags.includes('Romantic') || p.tags.includes('Slow'))) score += 2;
+    if (goals.includes('Power') && (p.tags.includes('Wild') || p.tags.includes('Active'))) score += 2;
+    
+    // Slight bonus if it matches other filter criteria (e.g. difficulty) even if it didn't match category
+    if (filters && filters.difficulties.length > 0 && filters.difficulties.includes(p.difficulty)) score += 1;
+    
+    return score;
+  };
+
   // Advanced Journey Builder
   const generateJourney = (candidates: Position[], goals: ClimaxGoal[]): Position[] => {
-    // 1. Calculate Relevance Score for each position
-    const scoredCandidates = candidates.map(p => {
-      let score = 0;
-      // High value for direct goal matches
-      p.climaxGoals.forEach(g => { if (goals.includes(g)) score += 5; });
-      // Bonus for tags that align with common archetypes
-      if (goals.includes('Intimacy') && (p.tags.includes('Romantic') || p.tags.includes('Slow'))) score += 2;
-      if (goals.includes('Power') && (p.tags.includes('Wild') || p.tags.includes('Active'))) score += 2;
-      return { ...p, score };
-    });
+    // 1. Calculate Relevance Score
+    const scoredCandidates = candidates.map(p => ({ 
+        ...p, 
+        score: scorePosition(p, goals) 
+    }));
 
     // 2. Identify Journey Archetype based on goals
     const isPowerJourney = goals.includes('Power') || goals.includes('Deep Penetration');
@@ -381,63 +391,90 @@ const App: React.FC = () => {
     let finalJourney: typeof scoredCandidates = [];
 
     // 3. Construct the Path
-    // NOTE: Removed slicing logic to ensure journeys are as long as possible (at least 10 if candidates allow)
     if (isPowerJourney && !isIntimacyJourney) {
-        // Archetype: "The Ascent"
+        // Archetype: "The Ascent" (Easy to Hard)
         finalJourney = [...scoredCandidates].sort((a, b) => (a.intensity - b.intensity) || (b.score - a.score));
     } 
     else if (isIntimacyJourney && !isPowerJourney) {
-        // Archetype: "The Deep Connection"
+        // Archetype: "The Deep Connection" (Lower intensity preferred, high relevance)
         finalJourney = [...scoredCandidates].sort((a, b) => (a.intensity - b.intensity) || (b.score - a.score));
     }
     else if (isVisualJourney) {
-        // Archetype: "The Showcase"
-        // Ensure we prioritize high scores but keep all matching candidates to maximize length
+        // Archetype: "The Showcase" (High Relevance first)
         const sortedByScore = [...scoredCandidates].sort((a, b) => b.score - a.score);
-        
-        // Put the top 3 (Stars) at strategic points, fill rest with everything else randomized
+        // Distribute "Stars" (top matches) throughout
         const stars = sortedByScore.slice(0, 3);
         const rest = shuffleArray(sortedByScore.slice(3));
 
         if (stars.length > 0) finalJourney.push(stars[0]); 
-        // Add half of the rest
         if (rest.length > 0) finalJourney.push(...rest.slice(0, Math.ceil(rest.length / 2)));
         if (stars.length > 1) finalJourney.push(stars[1]); 
-        // Add the rest of the rest
         if (rest.length > 0) finalJourney.push(...rest.slice(Math.ceil(rest.length / 2)));
         if (stars.length > 2) finalJourney.push(stars[2]); 
     } 
     else {
-        // Archetype: "The Explorer" (Default)
+        // Archetype: "The Explorer" (Random)
         finalJourney = shuffleArray(scoredCandidates);
     }
 
     return finalJourney;
   };
 
+  const getPaddedCandidates = (
+      pool: Position[], 
+      filterFn: (p: Position) => boolean, 
+      climaxGoals: ClimaxGoal[],
+      originalFilters: Filters
+  ): Position[] => {
+    // 1. Get exact matches
+    let candidates = pool.filter(filterFn);
+
+    // 2. If < 10, fill with "Suggested" positions from the remaining pool
+    if (candidates.length < 10) {
+        const existingIds = new Set(candidates.map(c => c.id));
+        const needed = 10 - candidates.length;
+        
+        // Potential backups are positions NOT in exact matches
+        const backups = pool.filter(p => !existingIds.has(p.id));
+        
+        // Sort backups by how well they match the 'vibe' (goals) even if they missed category/diff
+        const scoredBackups = backups.map(p => ({
+            position: p,
+            score: scorePosition(p, climaxGoals, originalFilters)
+        })).sort((a, b) => b.score - a.score);
+
+        // Take top N needed
+        const extras = scoredBackups.slice(0, needed).map(wrapper => wrapper.position);
+        candidates = [...candidates, ...extras];
+    }
+    return candidates;
+  };
+
   const handleStart = (filters: Filters) => {
     setLastFilters(filters);
     
-    // 1. Basic Filtering (First leg uses all available positions)
-    const candidates = INITIAL_POSITIONS.filter(p => {
-        const matchesCategory = filters.categories.length === 0 || filters.categories.includes(p.category);
-        const matchesDiff = filters.difficulties.length === 0 || filters.difficulties.includes(p.difficulty);
-        return matchesCategory && matchesDiff;
-    });
+    // Use all positions as the pool for a fresh start
+    const candidates = getPaddedCandidates(
+        INITIAL_POSITIONS,
+        (p) => {
+            const matchesCategory = filters.categories.length === 0 || filters.categories.includes(p.category);
+            const matchesDiff = filters.difficulties.length === 0 || filters.difficulties.includes(p.difficulty);
+            return matchesCategory && matchesDiff;
+        },
+        filters.climaxGoals,
+        filters
+    );
 
     if (candidates.length === 0) {
         alert("No positions found for these criteria. Try selecting more options.");
         return;
     }
 
-    // 2. Generate Curated Journey
     const curatedPlaylist = generateJourney(candidates, filters.climaxGoals);
 
     if (curatedPlaylist.length > 0) {
       setPlaylist(curatedPlaylist);
-      // Initialize playedIds with this first batch
       setPlayedIds(new Set(curatedPlaylist.map(p => p.id)));
-      
       setCurrentIndex(0);
       setSessionDuration(filters.durationPerPosition);
       setAppState('ACTIVE');
@@ -448,7 +485,6 @@ const App: React.FC = () => {
     if (currentIndex < playlist.length - 1) {
       setCurrentIndex(prev => prev + 1);
     } else {
-      // Reached the end -> Go to Completion Check
       setAppState('COMPLETION');
     }
   }, [currentIndex, playlist]);
@@ -461,7 +497,6 @@ const App: React.FC = () => {
   };
 
   const handleClimaxSuccess = () => {
-    // User finished successfully, clear session data
     setAppState('SETUP');
     setPlaylist([]);
     setPlayedIds(new Set());
@@ -474,51 +509,45 @@ const App: React.FC = () => {
         return;
     }
 
-    // 1. Find candidates matching filters that HAVE NOT been played yet
-    let candidates = INITIAL_POSITIONS.filter(p => {
-        const matchesCategory = lastFilters.categories.length === 0 || lastFilters.categories.includes(p.category);
-        const matchesDiff = lastFilters.difficulties.length === 0 || lastFilters.difficulties.includes(p.difficulty);
-        const alreadyPlayed = playedIds.has(p.id);
-        return matchesCategory && matchesDiff && !alreadyPlayed;
-    });
+    // 1. Identify unplayed positions available
+    const unplayedPool = INITIAL_POSITIONS.filter(p => !playedIds.has(p.id));
 
-    // 2. If we ran out of unique positions, allow recycling
-    if (candidates.length === 0) {
-        alert("You've explored every position in this category! Reshuffling the deck for a fresh start.");
-        
-        // Reset to allow all positions again
-        candidates = INITIAL_POSITIONS.filter(p => {
-             const matchesCategory = lastFilters.categories.length === 0 || lastFilters.categories.includes(p.category);
-             const matchesDiff = lastFilters.difficulties.length === 0 || lastFilters.difficulties.includes(p.difficulty);
-             return matchesCategory && matchesDiff;
-        });
-        
-        // Clear history since we are restarting the cycle
-        setPlayedIds(new Set());
-    }
-
-    if (candidates.length === 0) {
-        // Should only happen if filters match NOTHING in INITIAL_POSITIONS
-        alert("No positions available.");
-        setAppState('SETUP');
+    // 2. If we have run out of unplayed positions completely (or very low), we must reshuffle
+    if (unplayedPool.length < 5) { // Threshold for "running out"
+        alert("You have explored almost every known position! Reshuffling the deck for a fresh experience.");
+        setPlayedIds(new Set()); // Reset history
+        handleStart(lastFilters); // Start over
         return;
     }
 
-    // 3. Generate the next leg of the journey
+    // 3. Get candidates from unplayed pool, padding if necessary to reach 10
+    const candidates = getPaddedCandidates(
+        unplayedPool,
+        (p) => {
+            const matchesCategory = lastFilters.categories.length === 0 || lastFilters.categories.includes(p.category);
+            const matchesDiff = lastFilters.difficulties.length === 0 || lastFilters.difficulties.includes(p.difficulty);
+            return matchesCategory && matchesDiff;
+        },
+        lastFilters.climaxGoals,
+        lastFilters
+    );
+
+    // 4. Generate Journey
     const nextPlaylist = generateJourney(candidates, lastFilters.climaxGoals);
 
     if (nextPlaylist.length > 0) {
         setPlaylist(nextPlaylist);
-        
-        // Update history tracking
         setPlayedIds(prev => {
             const next = new Set(prev);
             nextPlaylist.forEach(p => next.add(p.id));
             return next;
         });
-        
         setCurrentIndex(0);
         setAppState('ACTIVE');
+    } else {
+        // Fallback (shouldn't be reached due to unplayedPool check above, but for safety)
+        alert("No more matching positions available.");
+        setAppState('SETUP');
     }
   };
 
